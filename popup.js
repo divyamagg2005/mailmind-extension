@@ -10,6 +10,10 @@ class MailMindPopup {
             await this.loadApiKey();
             this.setupEventListeners();
             await this.checkGmailTab();
+            // Auto-load email count on popup open
+            if (this.apiKey) {
+                this.loadEmailCount();
+            }
         } catch (error) {
             console.error('MailMind: Failed to initialize popup:', error);
             this.showError('Failed to initialize extension: ' + error.message);
@@ -25,7 +29,6 @@ class MailMindPopup {
                 this.showApiSetup();
             } else {
                 this.showMainContent();
-                // Don't auto-load on init, wait for user action
             }
         } catch (error) {
             console.error('Error loading API key:', error);
@@ -40,12 +43,6 @@ class MailMindPopup {
 
         document.getElementById('saveApiKey').addEventListener('click', () => {
             this.saveApiKey();
-        });
-
-        document.getElementById('refreshBtn').addEventListener('click', () => {
-            if (!this.isLoading) {
-                this.loadEmailSummary();
-            }
         });
 
         // Enter key support for API key input
@@ -99,8 +96,8 @@ class MailMindPopup {
                 await chrome.storage.local.set({ geminiApiKey: apiKey });
                 this.hideError();
                 this.showMainContent();
-                // Auto-load email summary after successful API key setup
-                setTimeout(() => this.loadEmailSummary(), 500);
+                // Auto-load email count after successful API key setup
+                setTimeout(() => this.loadEmailCount(), 500);
             } else {
                 this.showError('Invalid API key. Please check and try again.');
             }
@@ -152,7 +149,7 @@ class MailMindPopup {
         }
     }
 
-    async loadEmailSummary() {
+    async loadEmailCount() {
         if (this.isLoading) {
             console.log('Already loading, skipping request');
             return;
@@ -171,17 +168,11 @@ class MailMindPopup {
         this.showLoading(true);
         this.hideError();
 
-        // Update button state
-        const refreshBtn = document.getElementById('refreshBtn');
-        const refreshIcon = document.getElementById('refreshIcon');
-        refreshBtn.disabled = true;
-        refreshIcon.textContent = '⏳';
-
         try {
             // Get current tab
             const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
             
-            console.log('MailMind: Requesting emails from tab', tab.id);
+            console.log('MailMind: Requesting email count from tab', tab.id);
             
             // Add timeout to the message sending
             const response = await Promise.race([
@@ -197,28 +188,21 @@ class MailMindPopup {
                 throw new Error(response.error);
             }
 
-            if (!response.emails || response.emails.length === 0) {
-                this.showEmptyState();
-                // Still update counts to show 0
-                document.getElementById('emailCount').textContent = '0';
-                document.getElementById('unreadCount').textContent = '0';
-                return;
-            }
-
-            // Update stats - this should fix the incrementing issue
-            const emailCount = response.emails.length;
-            const unreadCount = response.unreadCount || 0;
+            // Update email count only
+            const emailCount = response.emails ? response.emails.length : 0;
             
-            console.log('MailMind: Updating UI with', emailCount, 'emails,', unreadCount, 'unread');
+            console.log('MailMind: Updating UI with', emailCount, 'emails today');
             
             document.getElementById('emailCount').textContent = emailCount.toString();
-            document.getElementById('unreadCount').textContent = unreadCount.toString();
 
-            // Generate summaries
-            await this.generateSummaries(response.emails);
+            if (emailCount === 0) {
+                this.showEmptyState();
+            } else {
+                this.hideEmptyState();
+            }
 
         } catch (error) {
-            console.error('Error loading email summary:', error);
+            console.error('Error loading email count:', error);
             
             // Handle specific error cases
             if (error.message.includes('Could not establish connection')) {
@@ -226,167 +210,49 @@ class MailMindPopup {
             } else if (error.message.includes('timeout')) {
                 this.showError('Request timed out. Gmail may be slow to load. Please try again.');
             } else {
-                this.showError('Failed to load emails: ' + error.message);
+                this.showError('Failed to load email count: ' + error.message);
             }
             
-            // Reset counts on error
+            // Reset count on error
             document.getElementById('emailCount').textContent = '-';
-            document.getElementById('unreadCount').textContent = '-';
         } finally {
             this.isLoading = false;
             this.showLoading(false);
-            
-            // Reset button state
-            refreshBtn.disabled = false;
-            refreshIcon.textContent = '🔄';
         }
-    }
-
-    async generateSummaries(emails) {
-        const summariesList = document.getElementById('summariesList');
-        summariesList.innerHTML = '';
-
-        // Show progress
-        const progressDiv = document.createElement('div');
-        progressDiv.className = 'summary-progress';
-        progressDiv.textContent = `Generating AI summaries for ${emails.length} today's emails...`;
-        summariesList.appendChild(progressDiv);
-
-        let processedCount = 0;
-        const totalEmails = Math.min(emails.length, 10);
-
-        for (const email of emails.slice(0, 10)) { // Limit to 10 emails
-            try {
-                const summary = await this.callGeminiAPI(
-                    `Summarize the following email received TODAY in 1-2 sentences. Focus on the key points and any action items:\n\nFrom: ${email.sender}\nSubject: ${email.subject}\n\nContent: ${email.preview}\n\nTime received: ${email.time}`
-                );
-
-                const summaryElement = this.createSummaryElement(email, summary);
-                
-                // Replace progress or append
-                if (processedCount === 0) {
-                    summariesList.removeChild(progressDiv);
-                }
-                
-                summaryElement.setAttribute('data-email-time', email.time || '');
-                summariesList.appendChild(summaryElement);
-                processedCount++;
-                
-                // Update progress if there are more emails
-                if (processedCount < totalEmails) {
-                    const remainingDiv = document.createElement('div');
-                    remainingDiv.className = 'summary-progress';
-                    remainingDiv.textContent = `Processing today's emails... (${processedCount}/${totalEmails})`;
-                    summariesList.appendChild(remainingDiv);
-                }
-                
-            } catch (error) {
-                console.error('Error generating summary for email:', error);
-                const summaryElement = this.createSummaryElement(email, 'Unable to generate summary - ' + error.message);
-                
-                if (processedCount === 0 && summariesList.contains(progressDiv)) {
-                    summariesList.removeChild(progressDiv);
-                }
-                
-                summariesList.appendChild(summaryElement);
-                processedCount++;
-            }
-            
-            // Small delay to prevent rate limiting
-            await this.delay(100);
-        }
-        
-        // Remove any remaining progress indicators
-        const remainingProgress = summariesList.querySelector('.summary-progress');
-        if (remainingProgress) {
-            summariesList.removeChild(remainingProgress);
-        }
-
-        // Add a note about today's emails
-        if (emails.length > 0) {
-            const noteDiv = document.createElement('div');
-            noteDiv.className = 'summary-note';
-            noteDiv.innerHTML = `<small>📅 Showing ${emails.length} emails received today only</small>`;
-            summariesList.appendChild(noteDiv);
-        }
-    }
-
-    delay(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    createSummaryElement(email, summary) {
-        const div = document.createElement('div');
-        div.className = 'summary-item';
-        
-        const isUnread = email.isUnread ? 'unread' : '';
-        
-        div.innerHTML = `
-            <div class="summary-header ${isUnread}">
-                <span class="sender">${this.escapeHtml(email.sender || 'Unknown Sender')}</span>
-                <span class="time">${this.escapeHtml(email.time || '')}</span>
-            </div>
-            <div class="summary-subject">${this.escapeHtml(email.subject || 'No Subject')}</div>
-            <div class="summary-text">${this.escapeHtml(summary)}</div>
-        `;
-        
-        return div;
-    }
-
-    escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    async callGeminiAPI(prompt) {
-        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp:generateContent?key=${this.apiKey}`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                contents: [{
-                    parts: [{
-                        text: prompt
-                    }]
-                }],
-                generationConfig: {
-                    temperature: 0.4,
-                    topK: 32,
-                    topP: 1,
-                    maxOutputTokens: 200,
-                }
-            })
-        });
-
-        if (!response.ok) {
-            const errorText = await response.text();
-            throw new Error(`Gemini API error: ${response.status} - ${errorText}`);
-        }
-
-        const data = await response.json();
-        const generatedText = data.candidates?.[0]?.content?.parts?.[0]?.text;
-        
-        if (!generatedText) {
-            throw new Error('No content generated by API');
-        }
-        
-        return generatedText;
     }
 
     showLoading(show) {
         document.getElementById('loading').style.display = show ? 'block' : 'none';
-        document.getElementById('summariesSection').style.display = show ? 'none' : 'block';
         document.getElementById('emptyState').style.display = 'none';
         document.getElementById('errorState').style.display = 'none';
+        
+        // Hide/show main content stats
+        const statsSection = document.querySelector('.stats-section');
+        const infoSection = document.querySelector('.info-section');
+        if (statsSection) statsSection.style.display = show ? 'none' : 'grid';
+        if (infoSection) infoSection.style.display = show ? 'none' : 'block';
     }
 
     showEmptyState() {
         document.getElementById('loading').style.display = 'none';
-        document.getElementById('summariesSection').style.display = 'none';
         document.getElementById('emptyState').style.display = 'block';
         document.getElementById('errorState').style.display = 'none';
+        
+        // Hide main content
+        const statsSection = document.querySelector('.stats-section');
+        const infoSection = document.querySelector('.info-section');
+        if (statsSection) statsSection.style.display = 'none';
+        if (infoSection) infoSection.style.display = 'none';
+    }
+
+    hideEmptyState() {
+        document.getElementById('emptyState').style.display = 'none';
+        
+        // Show main content
+        const statsSection = document.querySelector('.stats-section');
+        const infoSection = document.querySelector('.info-section');
+        if (statsSection) statsSection.style.display = 'grid';
+        if (infoSection) infoSection.style.display = 'block';
     }
 
     showError(message) {
@@ -404,10 +270,15 @@ class MailMindPopup {
         } else {
             // Show in main error state
             document.getElementById('loading').style.display = 'none';
-            document.getElementById('summariesSection').style.display = 'none';
             document.getElementById('emptyState').style.display = 'none';
             document.getElementById('errorState').style.display = 'block';
             document.getElementById('errorMessage').textContent = message;
+            
+            // Hide main content
+            const statsSection = document.querySelector('.stats-section');
+            const infoSection = document.querySelector('.info-section');
+            if (statsSection) statsSection.style.display = 'none';
+            if (infoSection) infoSection.style.display = 'none';
         }
     }
 
