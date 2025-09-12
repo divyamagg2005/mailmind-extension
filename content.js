@@ -7,6 +7,16 @@ class GmailContentScript {
         this.retryCount = 0;
         this.maxRetries = 5;
         this.apiKey = null;
+        
+        // New properties for multi-email selection
+        this.multiSelectObserver = null;
+        this.selectedEmails = new Set();
+        this.multiSelectSidebar = null;
+        this.isMultiSelectMode = false;
+        this.isMultiSidebarHidden = false; // Track sidebar visibility
+        this.lastMultiSelectData = null; // Store last processed data
+        this.multiSidebarUnhideBtn = null; // Floating unhide button for multi-select sidebar
+        
         this.init();
     }
 
@@ -15,8 +25,9 @@ class GmailContentScript {
         await this.loadApiKey();
         this.setupMessageListener();
         this.startObservingGmail();
+        this.startObservingMultiSelect();
         this.isInitialized = true;
-        console.log('MailMind content script initialized');
+        console.log('MailMind content script initialized with multi-select support');
     }
 
     async loadApiKey() {
@@ -50,6 +61,745 @@ class GmailContentScript {
         });
     }
 
+    // Start observing for multi-email selection
+    startObservingMultiSelect() {
+        this.multiSelectObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                if (mutation.type === 'childList' || mutation.type === 'attributes') {
+                    this.checkMultiSelectState();
+                }
+            });
+        });
+
+        this.multiSelectObserver.observe(document.body, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['class', 'aria-selected', 'data-selected']
+        });
+
+        document.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                this.clearMultiSelect();
+            }
+        });
+
+        document.addEventListener('click', (e) => {
+            if (e.target.matches('input[type="checkbox"]') || 
+                e.target.closest('.oZ-x3d') || 
+                e.target.closest('[role="checkbox"]')) {
+                setTimeout(() => this.checkMultiSelectState(), 100);
+            }
+        });
+    }
+
+    // Check if multiple emails are selected
+    checkMultiSelectState() {
+        const selectedRows = this.getSelectedEmailRows();
+        
+        if (selectedRows.length > 1) {
+            if (!this.isMultiSelectMode) {
+                this.isMultiSelectMode = true;
+                this.handleMultiSelect(selectedRows);
+            } else if (selectedRows.length !== this.selectedEmails.size) {
+                // Selection changed, update only if sidebar is visible or no previous data
+                if (!this.isMultiSidebarHidden || !this.lastMultiSelectData) {
+                    this.handleMultiSelect(selectedRows);
+                } else {
+                    // Just update the stored selection without processing
+                    this.selectedEmails = new Set(selectedRows);
+                }
+            }
+        } else if (selectedRows.length <= 1 && this.isMultiSelectMode) {
+            this.clearMultiSelect();
+        }
+    }
+
+    // Get currently selected email rows
+    getSelectedEmailRows() {
+        const selectedRows = [];
+        
+        const selectors = [
+            'tr[aria-selected="true"]',
+            'tr.x7',
+            'tr.yW.x7',
+            'tr[jsaction*="click"]:has(input[type="checkbox"]:checked)',
+            'tr:has(.oZ-x3d[aria-checked="true"])',
+            'tr:has([role="checkbox"][aria-checked="true"])'
+        ];
+
+        for (const selector of selectors) {
+            try {
+                const rows = document.querySelectorAll(selector);
+                if (rows.length > 0) {
+                    selectedRows.push(...Array.from(rows));
+                    break;
+                }
+            } catch (error) {
+                continue;
+            }
+        }
+
+        return [...new Set(selectedRows)];
+    }
+
+    // Handle multi-email selection
+    async handleMultiSelect(selectedRows) {
+        if (!this.apiKey) {
+            console.log('No API key available for multi-email processing');
+            return;
+        }
+
+        // Remove single email sidebar if it exists
+        this.removeEmailSidebar();
+
+        try {
+            const emailsData = [];
+            
+            for (const row of selectedRows.slice(0, 10)) {
+                const emailData = this.extractEmailData(row);
+                if (emailData) {
+                    const fullContent = await this.tryGetFullEmailContent(row);
+                    emailData.fullContent = fullContent || emailData.preview;
+                    emailsData.push(emailData);
+                }
+            }
+
+            if (emailsData.length > 1) {
+                this.selectedEmails = new Set(selectedRows);
+                this.lastMultiSelectData = emailsData;
+                
+                // Show sidebar if it's hidden, or create new one
+                if (this.isMultiSidebarHidden && this.multiSelectSidebar) {
+                    this.showMultiSidebar();
+                    this.updateMultiSidebarLoading();
+                } else {
+                    await this.createMultiEmailSidebar(emailsData);
+                }
+                
+                // Generate summaries
+                try {
+                    const summaries = await this.generateMultiEmailSummaries(emailsData);
+                    this.updateMultiSidebarContent(this.multiSelectSidebar, emailsData, summaries);
+                } catch (error) {
+                    console.error('Error generating multi-email summaries:', error);
+                    this.updateMultiSidebarError(this.multiSelectSidebar, error.message);
+                }
+            }
+
+        } catch (error) {
+            console.error('Error handling multi-select:', error);
+        }
+    }
+
+    // Try to get full email content
+    async tryGetFullEmailContent(row) {
+        try {
+            const preview = this.extractPreview(row);
+            return preview;
+        } catch (error) {
+            return null;
+        }
+    }
+
+    // Create sidebar for multiple emails with hide functionality
+    async createMultiEmailSidebar(emailsData) {
+        this.removeMultiSelectSidebar();
+
+        const sidebar = document.createElement('div');
+        sidebar.id = 'mailmind-multi-sidebar';
+        sidebar.className = 'mailmind-multi-sidebar';
+        
+        sidebar.innerHTML = `
+            <div class="mailmind-sidebar-header">
+                <div class="mailmind-sidebar-title">
+                    <span class="mailmind-icon">📚</span>
+                    <span>MailMind - ${emailsData.length} Emails</span>
+                </div>
+                <div class="mailmind-header-buttons">
+                    <button class="mailmind-hide-btn" title="Hide sidebar">−</button>
+                    <button class="mailmind-close-btn" title="Close sidebar">&times;</button>
+                </div>
+            </div>
+            <div class="mailmind-sidebar-content">
+                <div class="mailmind-loading">
+                    <div class="mailmind-spinner"></div>
+                    <p>Generating summaries for ${emailsData.length} emails...</p>
+                </div>
+            </div>
+        `;
+
+        // Add styles first to ensure they're loaded
+        this.addMultiSidebarStyles();
+        
+        document.body.appendChild(sidebar);
+        this.multiSelectSidebar = sidebar;
+        this.isMultiSidebarHidden = false;
+
+        // Add event listeners
+        sidebar.querySelector('.mailmind-close-btn').addEventListener('click', () => {
+            this.clearMultiSelect();
+        });
+
+        sidebar.querySelector('.mailmind-hide-btn').addEventListener('click', () => {
+            this.toggleMultiSidebar();
+        });
+    }
+
+    // Toggle sidebar visibility
+    toggleMultiSidebar() {
+        if (!this.multiSelectSidebar) return;
+
+        if (this.isMultiSidebarHidden) {
+            this.showMultiSidebar();
+        } else {
+            this.hideMultiSidebar();
+        }
+    }
+
+    // Hide sidebar
+    hideMultiSidebar() {
+        if (!this.multiSelectSidebar) return;
+        
+        this.multiSelectSidebar.classList.add('mailmind-sidebar-hidden');
+        this.isMultiSidebarHidden = true;
+        
+        // Update hide button text
+        const hideBtn = this.multiSelectSidebar.querySelector('.mailmind-hide-btn');
+        if (hideBtn) {
+            hideBtn.innerHTML = '+';
+            hideBtn.title = 'Show sidebar';
+        }
+
+        // Show floating unhide button
+        this.createMultiUnhideButton();
+    }
+
+    // Show sidebar
+    showMultiSidebar() {
+        if (!this.multiSelectSidebar) return;
+        
+        this.multiSelectSidebar.classList.remove('mailmind-sidebar-hidden');
+        this.isMultiSidebarHidden = false;
+        
+        // Update hide button text
+        const hideBtn = this.multiSelectSidebar.querySelector('.mailmind-hide-btn');
+        if (hideBtn) {
+            hideBtn.innerHTML = '−';
+            hideBtn.title = 'Hide sidebar';
+        }
+
+        // Remove floating unhide button when sidebar is visible
+        this.removeMultiUnhideButton();
+
+        // Re-check selection state to refresh content if it changed while hidden
+        try {
+            this.checkMultiSelectState();
+        } catch (e) {
+            // no-op
+        }
+    }
+
+    // Create a floating button to unhide multi-select sidebar
+    createMultiUnhideButton() {
+        if (this.multiSidebarUnhideBtn || !this.isMultiSelectMode) return;
+
+        const btn = document.createElement('button');
+        btn.className = 'mailmind-multi-unhide-btn';
+        btn.type = 'button';
+        btn.title = 'Show MailMind summaries';
+        btn.setAttribute('aria-label', 'Show MailMind summaries');
+        btn.textContent = '📚';
+
+        btn.addEventListener('click', () => {
+            this.showMultiSidebar();
+        });
+
+        document.body.appendChild(btn);
+        this.multiSidebarUnhideBtn = btn;
+    }
+
+    // Remove the floating unhide button if present
+    removeMultiUnhideButton() {
+        if (this.multiSidebarUnhideBtn && this.multiSidebarUnhideBtn.parentNode) {
+            this.multiSidebarUnhideBtn.parentNode.removeChild(this.multiSidebarUnhideBtn);
+        }
+        this.multiSidebarUnhideBtn = null;
+    }
+
+    // Update sidebar to loading state
+    updateMultiSidebarLoading() {
+        if (!this.multiSelectSidebar || !this.lastMultiSelectData) return;
+
+        const content = this.multiSelectSidebar.querySelector('.mailmind-sidebar-content');
+        if (content) {
+            content.innerHTML = `
+                <div class="mailmind-loading">
+                    <div class="mailmind-spinner"></div>
+                    <p>Generating summaries for ${this.lastMultiSelectData.length} emails...</p>
+                </div>
+            `;
+        }
+    }
+
+    // Generate summaries for multiple emails
+    async generateMultiEmailSummaries(emailsData) {
+        const summaries = [];
+        
+        for (const email of emailsData) {
+            try {
+                const summary = await this.generateEmailSummary(
+                    email.fullContent || email.preview, 
+                    email.subject, 
+                    email.sender
+                );
+                summaries.push({
+                    ...email,
+                    summary: summary
+                });
+            } catch (error) {
+                summaries.push({
+                    ...email,
+                    summary: 'Error generating summary: ' + error.message
+                });
+            }
+            
+            await this.delay(500);
+        }
+
+        return summaries;
+    }
+
+    // Update multi-sidebar content
+    updateMultiSidebarContent(sidebar, emailsData, summaryData) {
+        if (!sidebar) return;
+        
+        const content = sidebar.querySelector('.mailmind-sidebar-content');
+        
+        let individualSummariesHTML = '';
+        summaryData.forEach((email, index) => {
+            individualSummariesHTML += `
+                <div class="mailmind-email-item">
+                    <div class="mailmind-email-header">
+                        <div class="mailmind-email-sender">${this.escapeHtml(email.sender)}</div>
+                        <div class="mailmind-email-time">${this.escapeHtml(email.time)}</div>
+                    </div>
+                    <div class="mailmind-email-subject">${this.escapeHtml(email.subject)}</div>
+                    <div class="mailmind-email-summary">${this.escapeHtml(email.summary)}</div>
+                </div>
+            `;
+        });
+        
+        content.innerHTML = `
+            <div class="mailmind-individual-section">
+                <h4>📧 Email Summaries</h4>
+                <div class="mailmind-emails-list">
+                    ${individualSummariesHTML}
+                </div>
+            </div>
+            
+            <div class="mailmind-actions-section">
+                <button class="mailmind-export-btn">Export Summaries</button>
+                <button class="mailmind-clear-selection-btn">Clear Selection</button>
+            </div>
+        `;
+
+        // Add event listeners
+        content.querySelector('.mailmind-export-btn').addEventListener('click', () => {
+            this.exportSummaries(summaryData);
+        });
+
+        content.querySelector('.mailmind-clear-selection-btn').addEventListener('click', () => {
+            this.clearMultiSelect();
+        });
+    }
+
+    // Export summaries
+    exportSummaries(summaryData) {
+        let exportText = `MailMind - Email Summaries Export\n`;
+        exportText += `Generated on: ${new Date().toLocaleString()}\n\n`;
+        
+        exportText += `EMAIL SUMMARIES:\n`;
+        summaryData.forEach((email, index) => {
+            exportText += `\n${index + 1}. From: ${email.sender}\n`;
+            exportText += `   Subject: ${email.subject}\n`;
+            exportText += `   Time: ${email.time}\n`;
+            exportText += `   Summary: ${email.summary}\n`;
+        });
+
+        const blob = new Blob([exportText], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `mailmind-summaries-${new Date().toISOString().split('T')[0]}.txt`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+
+        this.showTemporaryMessage('Summaries exported successfully!');
+    }
+
+    // Update multi-sidebar with error
+    updateMultiSidebarError(sidebar, errorMessage) {
+        if (!sidebar) return;
+        
+        const content = sidebar.querySelector('.mailmind-sidebar-content');
+        content.innerHTML = `
+            <div class="mailmind-error">
+                <div class="mailmind-error-icon">⚠️</div>
+                <h4>Unable to process emails</h4>
+                <p>${this.escapeHtml(errorMessage)}</p>
+                <button class="mailmind-retry-btn">Try Again</button>
+            </div>
+        `;
+
+        content.querySelector('.mailmind-retry-btn').addEventListener('click', () => {
+            const selectedRows = this.getSelectedEmailRows();
+            if (selectedRows.length > 1) {
+                this.handleMultiSelect(selectedRows);
+            }
+        });
+    }
+
+    // Clear multi-selection
+    clearMultiSelect() {
+        this.isMultiSelectMode = false;
+        this.isMultiSidebarHidden = false;
+        this.selectedEmails.clear();
+        this.lastMultiSelectData = null;
+        this.removeMultiSelectSidebar();
+        this.removeMultiUnhideButton();
+        
+        try {
+            const selectAllCheckbox = document.querySelector('input[aria-label*="Select"]');
+            if (selectAllCheckbox && selectAllCheckbox.checked) {
+                selectAllCheckbox.click();
+            }
+        } catch (error) {
+            // Ignore if we can't clear selection
+        }
+    }
+
+    // Remove multi-select sidebar
+    removeMultiSelectSidebar() {
+        if (this.multiSelectSidebar) {
+            this.multiSelectSidebar.remove();
+            this.multiSelectSidebar = null;
+            this.isMultiSidebarHidden = false;
+        }
+        this.removeMultiUnhideButton();
+    }
+
+    // Add styles for multi-select sidebar with enhanced CSS specificity
+    addMultiSidebarStyles() {
+        // Remove existing styles first
+        const existingStyles = document.getElementById('mailmind-multi-sidebar-styles');
+        if (existingStyles) {
+            existingStyles.remove();
+        }
+
+        const styles = document.createElement('style');
+        styles.id = 'mailmind-multi-sidebar-styles';
+        styles.textContent = `
+            /* MailMind Multi-Sidebar Styles - Enhanced Specificity */
+            .mailmind-multi-sidebar {
+                position: fixed !important;
+                top: 80px !important;
+                right: 20px !important;
+                width: 400px !important;
+                max-height: 85vh !important;
+                background: white !important;
+                border: 1px solid #e1e5e9 !important;
+                border-radius: 12px !important;
+                box-shadow: 0 8px 32px rgba(0,0,0,0.15) !important;
+                z-index: 999999 !important;
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif !important;
+                overflow: hidden !important;
+                animation: mailmindSlideInRight 0.3s ease-out !important;
+                transition: transform 0.3s ease, opacity 0.3s ease !important;
+            }
+
+            /* Hidden state - move completely off-screen and disable interactions */
+            .mailmind-multi-sidebar.mailmind-sidebar-hidden {
+                transform: translateX(100%) !important;
+                opacity: 0 !important;
+                visibility: hidden !important;
+                pointer-events: none !important;
+            }
+
+            .mailmind-multi-sidebar.mailmind-sidebar-hidden .mailmind-sidebar-content {
+                display: none !important;
+            }
+
+            .mailmind-multi-sidebar.mailmind-sidebar-hidden .mailmind-sidebar-title span:last-child {
+                display: none !important;
+            }
+
+            @keyframes mailmindSlideInRight {
+                from {
+                    opacity: 0;
+                    transform: translateX(100%);
+                }
+                to {
+                    opacity: 1;
+                    transform: translateX(0);
+                }
+            }
+
+            .mailmind-sidebar-header {
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+                color: white !important;
+                padding: 16px !important;
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+            }
+
+            .mailmind-sidebar-title {
+                display: flex !important;
+                align-items: center !important;
+                gap: 8px !important;
+                font-weight: 600 !important;
+                font-size: 16px !important;
+            }
+
+            .mailmind-header-buttons {
+                display: flex !important;
+                gap: 4px !important;
+            }
+
+            .mailmind-close-btn,
+            .mailmind-hide-btn {
+                background: none !important;
+                border: none !important;
+                color: white !important;
+                font-size: 20px !important;
+                cursor: pointer !important;
+                padding: 4px 8px !important;
+                border-radius: 4px !important;
+                transition: background-color 0.2s !important;
+                width: 32px !important;
+                height: 32px !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+            }
+
+            .mailmind-close-btn:hover,
+            .mailmind-hide-btn:hover {
+                background-color: rgba(255,255,255,0.2) !important;
+            }
+
+            .mailmind-sidebar-content {
+                padding: 20px !important;
+                max-height: 60vh !important;
+                overflow-y: auto !important;
+            }
+
+            .mailmind-loading {
+                text-align: center !important;
+                padding: 40px 20px !important;
+            }
+
+            .mailmind-spinner {
+                width: 32px !important;
+                height: 32px !important;
+                border: 3px solid #f3f3f3 !important;
+                border-top: 3px solid #667eea !important;
+                border-radius: 50% !important;
+                animation: mailmindSpin 1s linear infinite !important;
+                margin: 0 auto 16px !important;
+            }
+
+            @keyframes mailmindSpin {
+                0% { transform: rotate(0deg); }
+                100% { transform: rotate(360deg); }
+            }
+
+            .mailmind-individual-section h4 {
+                margin-bottom: 12px !important;
+                color: #2d3748 !important;
+                font-size: 14px !important;
+                font-weight: 600 !important;
+            }
+
+            .mailmind-emails-list {
+                max-height: 400px !important;
+                overflow-y: auto !important;
+            }
+
+            .mailmind-email-item {
+                background: #f8f9fa !important;
+                border: 1px solid #e2e8f0 !important;
+                border-radius: 8px !important;
+                padding: 12px !important;
+                margin-bottom: 10px !important;
+                transition: box-shadow 0.2s !important;
+            }
+
+            .mailmind-email-item:hover {
+                box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+            }
+
+            .mailmind-email-header {
+                display: flex !important;
+                justify-content: space-between !important;
+                align-items: center !important;
+                margin-bottom: 6px !important;
+            }
+
+            .mailmind-email-sender {
+                font-size: 13px !important;
+                color: #4299e1 !important;
+                font-weight: 500 !important;
+                max-width: 200px !important;
+                overflow: hidden !important;
+                text-overflow: ellipsis !important;
+                white-space: nowrap !important;
+            }
+
+            .mailmind-email-time {
+                font-size: 11px !important;
+                color: #718096 !important;
+            }
+
+            .mailmind-email-subject {
+                font-size: 13px !important;
+                font-weight: 500 !important;
+                color: #2d3748 !important;
+                margin-bottom: 8px !important;
+                line-height: 1.3 !important;
+            }
+
+            .mailmind-email-summary {
+                font-size: 12px !important;
+                color: #4a5568 !important;
+                line-height: 1.4 !important;
+                background: white !important;
+                padding: 8px 10px !important;
+                border-radius: 4px !important;
+                border-left: 3px solid #4299e1 !important;
+            }
+
+            .mailmind-actions-section {
+                margin-top: 20px !important;
+                padding-top: 16px !important;
+                border-top: 1px solid #e2e8f0 !important;
+                display: flex !important;
+                gap: 8px !important;
+            }
+
+            .mailmind-export-btn,
+            .mailmind-clear-selection-btn,
+            .mailmind-retry-btn {
+                flex: 1 !important;
+                padding: 10px 16px !important;
+                border: none !important;
+                border-radius: 6px !important;
+                font-size: 13px !important;
+                font-weight: 500 !important;
+                cursor: pointer !important;
+                transition: all 0.2s !important;
+            }
+
+            .mailmind-export-btn {
+                background: #48bb78 !important;
+                color: white !important;
+            }
+
+            .mailmind-export-btn:hover {
+                background: #38a169 !important;
+            }
+
+            .mailmind-clear-selection-btn {
+                background: #edf2f7 !important;
+                color: #4a5568 !important;
+                border: 1px solid #e2e8f0 !important;
+            }
+
+            .mailmind-clear-selection-btn:hover {
+                background: #e2e8f0 !important;
+            }
+
+            .mailmind-retry-btn {
+                background: #4299e1 !important;
+                color: white !important;
+                width: 100% !important;
+            }
+
+            .mailmind-retry-btn:hover {
+                background: #3182ce !important;
+            }
+
+            /* Floating unhide button for multi-select sidebar */
+            .mailmind-multi-unhide-btn {
+                position: fixed !important;
+                bottom: 24px !important;
+                right: 24px !important;
+                width: 44px !important;
+                height: 44px !important;
+                border-radius: 50% !important;
+                border: none !important;
+                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+                color: #fff !important;
+                font-size: 20px !important;
+                line-height: 1 !important;
+                display: flex !important;
+                align-items: center !important;
+                justify-content: center !important;
+                cursor: pointer !important;
+                box-shadow: 0 8px 24px rgba(0,0,0,0.18) !important;
+                z-index: 1000000 !important;
+                transition: transform 0.15s ease, box-shadow 0.15s ease !important;
+            }
+
+            .mailmind-multi-unhide-btn:hover {
+                transform: scale(1.06) !important;
+                box-shadow: 0 10px 28px rgba(0,0,0,0.22) !important;
+            }
+
+            .mailmind-multi-unhide-btn:focus {
+                outline: none !important;
+                box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.35) !important;
+            }
+
+            .mailmind-error {
+                text-align: center !important;
+                padding: 40px 20px !important;
+            }
+
+            .mailmind-error-icon {
+                font-size: 32px !important;
+                margin-bottom: 12px !important;
+            }
+
+            .mailmind-error h4 {
+                color: #e53e3e !important;
+                margin-bottom: 8px !important;
+            }
+
+            .mailmind-error p {
+                color: #718096 !important;
+                font-size: 13px !important;
+                line-height: 1.4 !important;
+            }
+
+            @media (max-width: 500px) {
+                .mailmind-multi-sidebar {
+                    right: 10px !important;
+                    width: calc(100vw - 20px) !important;
+                    max-width: 400px !important;
+                }
+            }
+        `;
+        
+        // Insert at the beginning of head to ensure it loads early
+        document.head.insertBefore(styles, document.head.firstChild);
+        console.log('MailMind: Multi-sidebar styles added');
+    }
+
+    // Rest of the existing methods remain the same...
     async getEmailsFromToday() {
         try {
             await this.waitForGmailLoadWithRetries();
@@ -438,24 +1188,22 @@ class GmailContentScript {
             .trim();
     }
 
+    // Single email sidebar functionality
     startObservingGmail() {
         this.observer = new MutationObserver((mutations) => {
             mutations.forEach((mutation) => {
                 if (mutation.type === 'childList') {
-                    // Check if an email conversation view opened
                     const emailView = document.querySelector('[role="main"] [data-message-id]') ||
                                     document.querySelector('.ii.gt .a3s.aiL') ||
                                     document.querySelector('.ii.gt .a3s');
                     
                     if (emailView) {
-                        // Get a unique identifier for this email
                         const emailId = this.getEmailId(emailView);
                         if (emailId && emailId !== this.currentEmailId) {
                             this.currentEmailId = emailId;
                             setTimeout(() => this.handleEmailOpen(emailView), 1000);
                         }
                     } else {
-                        // Email closed, remove sidebar
                         this.removeEmailSidebar();
                         this.currentEmailId = null;
                     }
@@ -470,14 +1218,12 @@ class GmailContentScript {
     }
 
     getEmailId(emailView) {
-        // Try to get a unique identifier for the email
         const messageId = emailView.getAttribute('data-message-id') ||
                          emailView.closest('[data-message-id]')?.getAttribute('data-message-id') ||
                          emailView.closest('[data-legacy-thread-id]')?.getAttribute('data-legacy-thread-id');
         
         if (messageId) return messageId;
 
-        // Fallback: use subject + sender as identifier
         const subject = this.extractOpenEmailSubject(emailView);
         const sender = this.extractOpenEmailSender(emailView);
         
@@ -487,6 +1233,10 @@ class GmailContentScript {
     async handleEmailOpen(emailView) {
         if (!this.apiKey) {
             console.log('No API key available for email processing');
+            return;
+        }
+
+        if (this.isMultiSelectMode) {
             return;
         }
 
@@ -568,15 +1318,12 @@ class GmailContentScript {
     }
 
     async createEmailSidebar(emailContent, emailSubject, emailSender) {
-        // Remove existing sidebar
         this.removeEmailSidebar();
 
-        // Create sidebar container
         const sidebar = document.createElement('div');
         sidebar.id = 'mailmind-email-sidebar';
         sidebar.className = 'mailmind-sidebar';
         
-        // Initial loading state
         sidebar.innerHTML = `
             <div class="mailmind-sidebar-header">
                 <div class="mailmind-sidebar-title">
@@ -593,19 +1340,15 @@ class GmailContentScript {
             </div>
         `;
 
-        // Add styles
         this.addSidebarStyles();
         
-        // Position and show sidebar
         document.body.appendChild(sidebar);
         this.currentSidebar = sidebar;
 
-        // Add event listeners
         sidebar.querySelector('.mailmind-close-btn').addEventListener('click', () => {
             this.removeEmailSidebar();
         });
 
-        // Generate content
         try {
             const [summary, suggestedReply] = await Promise.all([
                 this.generateEmailSummary(emailContent, emailSubject, emailSender),
@@ -695,7 +1438,6 @@ Reply:`;
             </div>
         `;
 
-        // Add event listeners for reply actions
         content.querySelector('.mailmind-use-reply-btn').addEventListener('click', () => {
             this.insertReplyIntoCompose(suggestedReply);
         });
@@ -724,7 +1466,6 @@ Reply:`;
     }
 
     insertReplyIntoCompose(replyText) {
-        // Look for compose/reply boxes
         const composeSelectors = [
             '[aria-label*="Message Body"]',
             '[contenteditable="true"][aria-label*="compose"]',
@@ -740,13 +1481,11 @@ Reply:`;
                 composeBox.innerHTML = replyText.replace(/\n/g, '<br>');
                 composeBox.focus();
                 
-                // Show success message
                 this.showTemporaryMessage('Reply inserted into compose box!');
                 return;
             }
         }
 
-        // If no compose box found, try to open reply
         const replyButton = document.querySelector('[aria-label*="Reply"]') || 
                           document.querySelector('[data-tooltip*="Reply"]') ||
                           document.querySelector('.ams.bkH .amn');
