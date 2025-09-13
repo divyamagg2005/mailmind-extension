@@ -8,6 +8,15 @@ class GmailContentScript {
         this.maxRetries = 5;
         this.apiKey = null;
         
+        // Caching and queue properties
+        this.summaryCache = new Map();
+        this.inFlightSummaries = new Map();
+        this.summaryQueue = [];
+        this.isProcessingSummaryQueue = false;
+        this.summaryCacheStorageKey = 'mailmindSummaryCacheV1';
+        this._originalGenerateEmailSummary = null;
+        this._summaryWrapperInstalled = false;
+        
         // New properties for multi-email selection
         this.multiSelectObserver = null;
         this.selectedEmails = new Set();
@@ -23,6 +32,8 @@ class GmailContentScript {
     async init() {
         await this.delay(2000);
         await this.loadApiKey();
+        await this.loadSummaryCache();
+        this.installSummaryWrapper();
         this.setupMessageListener();
         this.startObservingGmail();
         this.startObservingMultiSelect();
@@ -41,6 +52,177 @@ class GmailContentScript {
 
     delay(ms) {
         return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    // ===== Caching + Queue: Initialization & Utilities =====
+    async loadSummaryCache() {
+        try {
+            const result = await chrome.storage.local.get([this.summaryCacheStorageKey]);
+            const raw = result[this.summaryCacheStorageKey] || {};
+            this.summaryCache = new Map(Object.entries(raw));
+            console.log('MailMind: Loaded summary cache with', this.summaryCache.size, 'entries');
+        } catch (e) {
+            console.warn('MailMind: Failed to load summary cache', e);
+            this.summaryCache = new Map();
+        }
+    }
+
+    installSummaryWrapper() {
+        if (this._summaryWrapperInstalled) return;
+        // Keep a reference to the original method and replace with wrapper
+        this._originalGenerateEmailSummary = this.generateEmailSummary.bind(this);
+        this.generateEmailSummary = this.generateEmailSummaryWithCacheQueue.bind(this);
+        this._summaryWrapperInstalled = true;
+        console.log('MailMind: Installed summary wrapper with cache + queue');
+    }
+
+    async generateEmailSummaryWithCacheQueue(emailContent, emailSubject, emailSender, options = {}) {
+        try {
+            const id = await this.computeSummaryId(
+                options?.id,
+                emailSubject,
+                emailContent,
+                options?.time || ''
+            );
+
+            // 1) Cache hit
+            const cached = this.getCachedSummary(id);
+            if (cached) {
+                return cached;
+            }
+
+            // 2) In-flight reuse
+            if (this.inFlightSummaries.has(id)) {
+                return await this.inFlightSummaries.get(id);
+            }
+
+            // 3) Enqueue a new task (concurrency = 1)
+            const taskPromise = this.enqueueSummaryTask(id, async () => {
+                const summary = await this._originalGenerateEmailSummary(emailContent, emailSubject, emailSender);
+                await this.setCachedSummary(id, summary);
+                return summary;
+            });
+
+            this.inFlightSummaries.set(id, taskPromise);
+            try {
+                const result = await taskPromise;
+                return result;
+            } finally {
+                this.inFlightSummaries.delete(id);
+            }
+        } catch (err) {
+            // Fall back to original on unexpected wrapper errors
+            console.warn('MailMind: Wrapper error, falling back', err);
+            return await this._originalGenerateEmailSummary(emailContent, emailSubject, emailSender);
+        }
+    }
+
+    enqueueSummaryTask(id, runFn) {
+        return new Promise((resolve, reject) => {
+            this.summaryQueue.push({ id, runFn, resolve, reject });
+            this.processSummaryQueue();
+        });
+    }
+
+    async processSummaryQueue() {
+        if (this.isProcessingSummaryQueue) return;
+        const task = this.summaryQueue.shift();
+        if (!task) return;
+
+        this.isProcessingSummaryQueue = true;
+        try {
+            const res = await task.runFn();
+            task.resolve(res);
+        } catch (e) {
+            task.reject(e);
+        } finally {
+            this.isProcessingSummaryQueue = false;
+            if (this.summaryQueue.length > 0) {
+                // Continue processing remaining tasks
+                this.processSummaryQueue();
+            }
+        }
+    }
+
+    getCachedSummary(id) {
+        return this.summaryCache.get(id) || null;
+    }
+
+    async setCachedSummary(id, summary) {
+        try {
+            this.summaryCache.set(id, summary);
+            // Persist incrementally
+            const result = await chrome.storage.local.get([this.summaryCacheStorageKey]);
+            const raw = result[this.summaryCacheStorageKey] || {};
+            raw[id] = summary;
+            await chrome.storage.local.set({ [this.summaryCacheStorageKey]: raw });
+        } catch (e) {
+            console.warn('MailMind: Failed to persist summary to cache', e);
+        }
+    }
+
+    async computeSummaryId(explicitId, subject, body, time) {
+        if (explicitId && typeof explicitId === 'string') return explicitId;
+
+        // Prefer message-id from open email view if available
+        const mid = this.getOpenMessageIdFromDOM();
+        if (mid) return `mid:${mid}`;
+
+        const first50 = (body || '').substring(0, 50);
+        const t = time || this.extractOpenEmailTimeFromDOM() || '';
+        const composite = `${subject || ''}|${t}|${first50}`;
+        const hex = await this.computeSHA256Hex(composite);
+        return `hash:${hex}`;
+    }
+
+    getOpenMessageIdFromDOM() {
+        try {
+            const el = document.querySelector('[role="main"] [data-message-id]') ||
+                      document.querySelector('[data-message-id]');
+            const mid = el?.getAttribute('data-message-id');
+            return mid || '';
+        } catch {
+            return '';
+        }
+    }
+
+    extractOpenEmailTimeFromDOM() {
+        try {
+            const timeEl = document.querySelector('[role="main"] time') || document.querySelector('time');
+            if (timeEl) {
+                return timeEl.getAttribute('datetime') || (timeEl.textContent || '').trim();
+            }
+            const alt = document.querySelector('.g3 span') || document.querySelector('.gH [title]');
+            if (alt) {
+                return alt.getAttribute('title') || (alt.textContent || '').trim();
+            }
+        } catch { /* no-op */ }
+        return '';
+    }
+
+    async computeRowEmailId(row, emailData) {
+        try {
+            const midEl = row.querySelector('[data-message-id]') || row.closest('[data-message-id]');
+            const mid = midEl?.getAttribute('data-message-id');
+            if (mid) return `mid:${mid}`;
+        } catch { /* ignore */ }
+
+        const first50 = (emailData.fullContent || emailData.preview || '').substring(0, 50);
+        const composite = `${emailData.subject || ''}|${emailData.time || ''}|${first50}`;
+        const hex = await this.computeSHA256Hex(composite);
+        return `hash:${hex}`;
+    }
+
+    async computeSHA256Hex(input) {
+        const enc = new TextEncoder();
+        const data = enc.encode(input || '');
+        const hash = await crypto.subtle.digest('SHA-256', data);
+        const bytes = new Uint8Array(hash);
+        let hex = '';
+        for (let i = 0; i < bytes.length; i++) {
+            hex += bytes[i].toString(16).padStart(2, '0');
+        }
+        return hex;
     }
 
     setupMessageListener() {
@@ -161,6 +343,12 @@ class GmailContentScript {
                 if (emailData) {
                     const fullContent = await this.tryGetFullEmailContent(row);
                     emailData.fullContent = fullContent || emailData.preview;
+                    try {
+                        emailData.id = await this.computeRowEmailId(row, emailData);
+                    } catch (e) {
+                        // Non-blocking fallback ID
+                        emailData.id = `${emailData.subject || ''}|${emailData.time || ''}|${(emailData.fullContent || emailData.preview || '').substring(0,50)}`;
+                    }
                     emailsData.push(emailData);
                 }
             }
@@ -347,11 +535,23 @@ class GmailContentScript {
         const summaries = [];
         
         for (const email of emailsData) {
+            const cached = email.id ? this.getCachedSummary(email.id) : null;
+            if (cached) {
+                summaries.push({ ...email, summary: cached });
+                try {
+                    if (this.multiSelectSidebar) {
+                        this.updateMultiSidebarContent(this.multiSelectSidebar, emailsData, summaries);
+                    }
+                } catch { /* no-op */ }
+                continue; // Skip API call and delay
+            }
+
             try {
                 const summary = await this.generateEmailSummary(
-                    email.fullContent || email.preview, 
-                    email.subject, 
-                    email.sender
+                    email.fullContent || email.preview,
+                    email.subject,
+                    email.sender,
+                    { id: email.id, time: email.time }
                 );
                 summaries.push({
                     ...email,
@@ -363,6 +563,13 @@ class GmailContentScript {
                     summary: 'Error generating summary: ' + error.message
                 });
             }
+
+            // Incremental UI update for multi-select as each summary completes
+            try {
+                if (this.multiSelectSidebar) {
+                    this.updateMultiSidebarContent(this.multiSelectSidebar, emailsData, summaries);
+                }
+            } catch { /* no-op */ }
             
             await this.delay(500);
         }
