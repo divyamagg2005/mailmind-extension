@@ -491,7 +491,7 @@ class GmailContentScript {
         this.removeMultiUnhideButton();
     }
 
-    // Add styles for multi-select sidebar with enhanced CSS specificity
+    // Add styles for multi-select sidebar with fixed height and scrollable email list
     addMultiSidebarStyles() {
         // Remove existing styles first
         const existingStyles = document.getElementById('mailmind-multi-sidebar-styles');
@@ -502,13 +502,13 @@ class GmailContentScript {
         const styles = document.createElement('style');
         styles.id = 'mailmind-multi-sidebar-styles';
         styles.textContent = `
-            /* MailMind Multi-Sidebar Styles - Enhanced Specificity */
+            /* MailMind Multi-Sidebar Styles - Fixed Height with Scrollable Email List */
             .mailmind-multi-sidebar {
                 position: fixed !important;
                 top: 80px !important;
                 right: 20px !important;
                 width: 400px !important;
-                max-height: 85vh !important;
+                height: 85vh !important;
                 background: white !important;
                 border: 1px solid #e1e5e9 !important;
                 border-radius: 12px !important;
@@ -518,6 +518,8 @@ class GmailContentScript {
                 overflow: hidden !important;
                 animation: mailmindSlideInRight 0.3s ease-out !important;
                 transition: transform 0.3s ease, opacity 0.3s ease !important;
+                display: flex !important;
+                flex-direction: column !important;
             }
 
             /* Hidden state - move completely off-screen and disable interactions */
@@ -554,6 +556,7 @@ class GmailContentScript {
                 display: flex !important;
                 justify-content: space-between !important;
                 align-items: center !important;
+                flex-shrink: 0 !important;
             }
 
             .mailmind-sidebar-title {
@@ -592,13 +595,19 @@ class GmailContentScript {
             }
 
             .mailmind-sidebar-content {
-                padding: 20px !important;
-                max-height: 60vh !important;
-                overflow-y: auto !important;
+                flex: 1 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                overflow: hidden !important;
+                padding: 0 !important;
             }
 
             .mailmind-loading {
-                text-align: center !important;
+                flex: 1 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                justify-content: center !important;
+                align-items: center !important;
                 padding: 40px 20px !important;
             }
 
@@ -617,16 +626,27 @@ class GmailContentScript {
                 100% { transform: rotate(360deg); }
             }
 
+            .mailmind-individual-section {
+                flex: 1 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                padding: 20px 20px 0 20px !important;
+                overflow: hidden !important;
+            }
+
             .mailmind-individual-section h4 {
                 margin-bottom: 12px !important;
                 color: #2d3748 !important;
                 font-size: 14px !important;
                 font-weight: 600 !important;
+                flex-shrink: 0 !important;
             }
 
             .mailmind-emails-list {
-                max-height: 400px !important;
+                flex: 1 !important;
                 overflow-y: auto !important;
+                padding-right: 8px !important;
+                margin-right: -8px !important;
             }
 
             .mailmind-email-item {
@@ -636,10 +656,15 @@ class GmailContentScript {
                 padding: 12px !important;
                 margin-bottom: 10px !important;
                 transition: box-shadow 0.2s !important;
+                flex-shrink: 0 !important;
             }
 
             .mailmind-email-item:hover {
                 box-shadow: 0 2px 4px rgba(0,0,0,0.1) !important;
+            }
+
+            .mailmind-email-item:last-child {
+                margin-bottom: 0 !important;
             }
 
             .mailmind-email-header {
@@ -683,8 +708,9 @@ class GmailContentScript {
             }
 
             .mailmind-actions-section {
-                margin-top: 20px !important;
-                padding-top: 16px !important;
+                flex-shrink: 0 !important;
+                margin: 0 !important;
+                padding: 16px 20px 20px 20px !important;
                 border-top: 1px solid #e2e8f0 !important;
                 display: flex !important;
                 gap: 8px !important;
@@ -732,6 +758,24 @@ class GmailContentScript {
                 background: #3182ce !important;
             }
 
+            /* Custom scrollbar for the emails list */
+            .mailmind-emails-list::-webkit-scrollbar {
+                width: 6px !important;
+            }
+
+            .mailmind-emails-list::-webkit-scrollbar-track {
+                background: transparent !important;
+            }
+
+            .mailmind-emails-list::-webkit-scrollbar-thumb {
+                background: #cbd5e0 !important;
+                border-radius: 3px !important;
+            }
+
+            .mailmind-emails-list::-webkit-scrollbar-thumb:hover {
+                background: #a0aec0 !important;
+            }
+
             /* Floating unhide button for multi-select sidebar */
             .mailmind-multi-unhide-btn {
                 position: fixed !important;
@@ -765,7 +809,11 @@ class GmailContentScript {
             }
 
             .mailmind-error {
-                text-align: center !important;
+                flex: 1 !important;
+                display: flex !important;
+                flex-direction: column !important;
+                justify-content: center !important;
+                align-items: center !important;
                 padding: 40px 20px !important;
             }
 
@@ -783,6 +831,13 @@ class GmailContentScript {
                 color: #718096 !important;
                 font-size: 13px !important;
                 line-height: 1.4 !important;
+            }
+
+            /* Responsive adjustments */
+            @media (max-height: 600px) {
+                .mailmind-multi-sidebar {
+                    height: 90vh !important;
+                }
             }
 
             @media (max-width: 500px) {
